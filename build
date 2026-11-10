@@ -1,0 +1,105 @@
+name: Build IPA
+
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out
+        uses: actions/checkout@v6
+
+      - name: Unpack Encore.zip if the source was uploaded as a zip
+        run: |
+          for archive in *.zip; do
+            if [ -f "$archive" ]; then
+              unzip -o -q "$archive"
+            fi
+          done
+          if [ ! -f project.yml ] && [ -f Encore/project.yml ]; then
+            cp -R Encore/. .
+          fi
+          if [ ! -f project.yml ]; then
+            echo "::error::project.yml not found. Upload Encore.zip to the top level of this repository."
+            exit 1
+          fi
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Install XcodeGen
+        run: command -v xcodegen || brew install xcodegen
+
+      - name: Generate the Xcode project
+        run: xcodegen generate
+
+      - name: Build the app (unsigned)
+        run: |
+          set +e
+          xcodebuild \
+            -project Encore.xcodeproj \
+            -target Encore \
+            -configuration Release \
+            -sdk iphoneos \
+            SYMROOT="$PWD/out" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build > build.log 2>&1
+          status=$?
+          if [ "$status" -ne 0 ]; then
+            echo "Build failed. Compiler errors:"
+            grep -E "error:" build.log > errors.txt || true
+            sort -u errors.txt | head -n 60 | while IFS= read -r line; do
+              echo "::error::$line"
+            done
+            echo "---- last 80 lines of the build log ----"
+            tail -n 80 build.log || true
+            exit 1
+          fi
+          echo "Build succeeded."
+
+      - name: Package the IPA
+        run: |
+          APP="$(find out -type d -name 'Encore.app' | head -n 1)"
+          if [ -z "$APP" ]; then
+            echo "::error::Encore.app was not produced."
+            exit 1
+          fi
+          rm -rf Payload
+          mkdir Payload
+          cp -R "$APP" Payload/
+          zip -q -r -y Encore.ipa Payload
+          ls -lh Encore.ipa
+
+      - name: Upload the IPA as a build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: Encore-ipa
+          path: Encore.ipa
+
+      - name: Publish the IPA on the Releases page
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "build-${{ github.run_number }}" Encore.ipa \
+            --repo "${{ github.repository }}" \
+            --target "${{ github.sha }}" \
+            --title "Encore build ${{ github.run_number }}" \
+            --notes "Unsigned IPA. Sign and install it with your sideloading tool."
+
+      - name: Keep the build log when something fails
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
